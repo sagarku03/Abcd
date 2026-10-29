@@ -36,7 +36,7 @@ jobs:
 
       - name: Install Dependencies & Build Web App
         run: |
-          npm ci || npm install
+          npm ci --legacy-peer-deps || npm install --legacy-peer-deps
           npm run build
 
       - name: Prepare Android Assets
