@@ -1,0 +1,6 @@
+{
+  "name": "AlignPulse - Ultra-Precise Audio Transcription & Forced-Alignment Engine",
+  "description": "Word-by-word verbatim speech transcription and millisecond-precision forced alignment engine with timeline sync, interactive waveform, and subtitle export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
