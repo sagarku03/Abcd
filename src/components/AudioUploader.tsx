@@ -8,9 +8,19 @@ import {
   Languages,
   Sliders,
   AlertCircle,
+  Key,
+  ExternalLink,
+  Check,
+  Zap,
 } from 'lucide-react';
 import { decodeAudioBlob } from '../utils/audioHelper.ts';
 import { countRealWords } from '../utils/scriptAligner.ts';
+
+export interface WhisperConfig {
+  provider: 'groq' | 'openai';
+  model: string;
+  apiKey: string;
+}
 
 interface AudioUploaderProps {
   onAudioReady: (data: {
@@ -22,6 +32,8 @@ interface AudioUploaderProps {
     referenceTranscript?: string;
     languageHint: string;
     modelChoice: string;
+    engineType: 'gemini' | 'whisper';
+    whisperConfig?: WhisperConfig;
   }) => void;
   isProcessing: boolean;
   processingProgress?: string;
@@ -45,6 +57,16 @@ export const AudioUploader: React.FC<AudioUploaderProps> = ({
   const audioChunksRef = useRef<Blob[]>([]);
   const timerIntervalRef = useRef<any>(null);
 
+  // Engine selection: Whisper vs Gemini
+  const [engineType, setEngineType] = useState<'whisper' | 'gemini'>('whisper');
+  const [whisperProvider, setWhisperProvider] = useState<'groq' | 'openai'>('groq');
+  const [whisperModel, setWhisperModel] = useState<string>('whisper-large-v3');
+  const [whisperApiKey, setWhisperApiKey] = useState<string>(() => {
+    return localStorage.getItem('alignpulse_whisper_api_key') || '';
+  });
+  const [serverHasWhisperKey, setServerHasWhisperKey] = useState<boolean>(false);
+  const [isKeySaved, setIsKeySaved] = useState<boolean>(false);
+
   // Script Forced Alignment Mode (default to script for 100% accuracy)
   const [alignmentMode, setAlignmentMode] = useState<'script' | 'speech'>('script');
   const [referenceText, setReferenceText] = useState('');
@@ -54,6 +76,25 @@ export const AudioUploader: React.FC<AudioUploaderProps> = ({
   const [modelChoice, setModelChoice] = useState('gemini-3.1-flash-lite');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Check server engine status on mount
+  useEffect(() => {
+    fetch('/api/engine-status')
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.whisper && data.whisper.hasServerKey) {
+          setServerHasWhisperKey(true);
+        }
+      })
+      .catch((e) => console.debug('Engine status check failed:', e));
+  }, []);
+
+  const handleSaveWhisperKey = (key: string) => {
+    setWhisperApiKey(key);
+    localStorage.setItem('alignpulse_whisper_api_key', key.trim());
+    setIsKeySaved(true);
+    setTimeout(() => setIsKeySaved(false), 2000);
+  };
 
   // Clean up recording timer on unmount
   useEffect(() => {
@@ -135,6 +176,17 @@ export const AudioUploader: React.FC<AudioUploaderProps> = ({
   const handleStartAnalysis = async () => {
     if (!selectedBlob) return;
     setErrorMsg(null);
+
+    if (engineType === 'whisper') {
+      const effectiveKey = (whisperApiKey || '').trim();
+      if (!effectiveKey && !serverHasWhisperKey) {
+        setErrorMsg(
+          'Whisper Engine ke liye API Key zaroori hai. Kripya niche apna Groq API Key (console.groq.com se bilkul FREE) ya OpenAI API Key enter karein.'
+        );
+        return;
+      }
+    }
+
     onAudioReady({
       blob: selectedBlob,
       mimeType,
@@ -142,7 +194,16 @@ export const AudioUploader: React.FC<AudioUploaderProps> = ({
       durationSec: detectedDuration,
       referenceTranscript: alignmentMode === 'script' && referenceText.trim() ? referenceText.trim() : undefined,
       languageHint,
-      modelChoice,
+      modelChoice: engineType === 'whisper' ? whisperModel : modelChoice,
+      engineType,
+      whisperConfig:
+        engineType === 'whisper'
+          ? {
+              provider: whisperProvider,
+              model: whisperModel,
+              apiKey: whisperApiKey.trim(),
+            }
+          : undefined,
     });
   };
 
@@ -279,8 +340,123 @@ export const AudioUploader: React.FC<AudioUploaderProps> = ({
         </div>
       )}
 
-      {/* Alignment Mode Selector & Script Input */}
+      {/* Engine Selection: Whisper vs Gemini */}
       <div className="mb-6 space-y-3">
+        <div className="grid grid-cols-2 gap-2 p-1 bg-zinc-950/80 border border-zinc-800 rounded-xl">
+          <button
+            type="button"
+            onClick={() => setEngineType('whisper')}
+            className={`py-2.5 px-3 rounded-lg text-xs font-semibold flex items-center justify-center gap-2 transition-all ${
+              engineType === 'whisper'
+                ? 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-lg shadow-emerald-950/40 ring-1 ring-emerald-400/40'
+                : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/60'
+            }`}
+          >
+            <Zap className="w-3.5 h-3.5 text-emerald-300" />
+            <span>Whisper Engine (Word Timestamps)</span>
+            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-black/40 text-emerald-200 font-bold">
+              100% SYNC
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setEngineType('gemini')}
+            className={`py-2.5 px-3 rounded-lg text-xs font-semibold flex items-center justify-center gap-2 transition-all ${
+              engineType === 'gemini'
+                ? 'bg-gradient-to-r from-indigo-600 to-cyan-600 text-white shadow-lg shadow-indigo-950/40 ring-1 ring-cyan-400/40'
+                : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/60'
+            }`}
+          >
+            <Sparkles className="w-3.5 h-3.5 text-cyan-300" />
+            <span>Gemini AI Engine</span>
+          </button>
+        </div>
+
+        {/* Whisper Specific Configuration Card */}
+        {engineType === 'whisper' && (
+          <div className="p-4 rounded-xl bg-emerald-950/20 border border-emerald-800/50 space-y-3 animate-in fade-in">
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                <span className="text-xs font-semibold text-emerald-200">
+                  Whisper Speech-to-Text (Acoustic Word Timestamps)
+                </span>
+              </div>
+              <div className="flex items-center gap-2 text-[11px]">
+                {serverHasWhisperKey && (
+                  <span className="text-emerald-300 font-mono flex items-center gap-1 bg-emerald-950/80 px-2 py-0.5 rounded border border-emerald-700/50">
+                    <Check className="w-3 h-3" /> Server Key Active
+                  </span>
+                )}
+                <a
+                  href="https://console.groq.com/keys"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-cyan-300 hover:text-cyan-200 underline flex items-center gap-1"
+                >
+                  Free Groq Key lein <ExternalLink className="w-3 h-3" />
+                </a>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="text-[11px] font-medium text-zinc-400 flex items-center gap-1.5 mb-1">
+                  <Sliders className="w-3 h-3 text-emerald-400" />
+                  Whisper Provider & Model
+                </label>
+                <select
+                  value={`${whisperProvider}:${whisperModel}`}
+                  onChange={(e) => {
+                    const [p, m] = e.target.value.split(':');
+                    setWhisperProvider(p as 'groq' | 'openai');
+                    setWhisperModel(m);
+                  }}
+                  className="w-full rounded-lg bg-zinc-900 border border-zinc-700/80 px-3 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-emerald-500"
+                >
+                  <option value="groq:whisper-large-v3">Groq Whisper Large v3 (Fastest ~1s & High Accuracy)</option>
+                  <option value="groq:whisper-large-v3-turbo">Groq Whisper Large v3 Turbo (Ultra Fast)</option>
+                  <option value="openai:whisper-1">OpenAI Whisper-1</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="text-[11px] font-medium text-zinc-400 flex items-center justify-between mb-1">
+                  <span className="flex items-center gap-1.5">
+                    <Key className="w-3 h-3 text-amber-400" />
+                    API Key (Groq / OpenAI)
+                  </span>
+                  {isKeySaved && <span className="text-emerald-400 text-[10px]">Saved in browser!</span>}
+                </label>
+                <div className="flex gap-1.5">
+                  <input
+                    type="password"
+                    value={whisperApiKey}
+                    onChange={(e) => handleSaveWhisperKey(e.target.value)}
+                    placeholder={serverHasWhisperKey ? 'Using Server Key (Optional override)' : 'gsk_... ya sk-...'}
+                    className="flex-1 rounded-lg bg-zinc-900 border border-zinc-700/80 px-3 py-1.5 text-xs text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-emerald-500 font-mono"
+                  />
+                  {whisperApiKey && (
+                    <button
+                      type="button"
+                      onClick={() => handleSaveWhisperKey('')}
+                      className="px-2 py-1 rounded bg-zinc-800 text-zinc-400 hover:text-white text-[11px]"
+                      title="Clear"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <p className="text-[11px] text-zinc-400 leading-relaxed">
+              Whisper se audio wave ka direct acoustic transcription hota hai: <strong>0 chunks cut hone ki tension nahi</strong>, bich ka ek bhi word gayab nahi hota, aur wave ke sath perfect match hota hai.
+            </p>
+          </div>
+        )}
+
+        {/* Alignment Mode Selector & Script Input */}
         <div className="grid grid-cols-2 gap-2 p-1 bg-zinc-950/80 border border-zinc-800 rounded-xl">
           <button
             type="button"
@@ -362,18 +538,25 @@ export const AudioUploader: React.FC<AudioUploaderProps> = ({
           <div className="p-3 rounded-xl bg-zinc-950/40 border border-zinc-800">
             <label className="text-xs font-medium text-zinc-400 flex items-center gap-1.5 mb-1.5">
               <Sparkles className="w-3.5 h-3.5 text-violet-400" />
-              AI Transcription Model
+              {engineType === 'whisper' ? 'Whisper Engine' : 'AI Transcription Model'}
             </label>
-            <select
-              value={modelChoice}
-              onChange={(e) => setModelChoice(e.target.value)}
-              className="w-full rounded-lg bg-zinc-900 border border-zinc-700/80 px-3 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-violet-500"
-            >
-              <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (Recommended - Fast & Active Quota)</option>
-              <option value="gemini-3.5-transcribe">gemini-3.5-transcribe (Speech-to-Text Dedicated)</option>
-              <option value="gemini-3.8-flash">gemini-3.8-flash (Ultra Fidelity - Daily Free Limit 20 Req)</option>
-              <option value="gemini-flash-latest">gemini-flash-latest</option>
-            </select>
+            {engineType === 'whisper' ? (
+              <div className="py-2 px-3 rounded-lg bg-zinc-900 border border-zinc-700/80 text-xs text-emerald-300 font-mono flex items-center justify-between">
+                <span>{whisperProvider.toUpperCase()} / {whisperModel}</span>
+                <span className="text-[10px] text-zinc-400">Word-level Timestamps</span>
+              </div>
+            ) : (
+              <select
+                value={modelChoice}
+                onChange={(e) => setModelChoice(e.target.value)}
+                className="w-full rounded-lg bg-zinc-900 border border-zinc-700/80 px-3 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-violet-500"
+              >
+                <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (Fast & Active Quota)</option>
+                <option value="gemini-3.5-transcribe">gemini-3.5-transcribe (Speech-to-Text Dedicated)</option>
+                <option value="gemini-3.8-flash">gemini-3.8-flash (Ultra Fidelity)</option>
+                <option value="gemini-flash-latest">gemini-flash-latest</option>
+              </select>
+            )}
           </div>
         </div>
       </div>

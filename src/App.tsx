@@ -10,6 +10,7 @@ import { ExportModal } from './components/ExportModal.tsx';
 import { RulesModal } from './components/RulesModal.tsx';
 import { ScriptAlignmentModal } from './components/ScriptAlignmentModal.tsx';
 import { WordToken } from './types.ts';
+import { WhisperConfig } from './components/AudioUploader.tsx';
 import { prepareOptimizedAudioChunks } from './utils/audioHelper.ts';
 import {
   stitchChunkTokens,
@@ -210,6 +211,8 @@ export default function App() {
     referenceTranscript,
     languageHint,
     modelChoice,
+    engineType = 'whisper',
+    whisperConfig,
   }: {
     blob: Blob;
     base64?: string;
@@ -219,6 +222,8 @@ export default function App() {
     referenceTranscript?: string;
     languageHint: string;
     modelChoice: string;
+    engineType?: 'gemini' | 'whisper';
+    whisperConfig?: WhisperConfig;
   }) => {
     setIsProcessing(true);
     setErrorMessage(null);
@@ -230,116 +235,203 @@ export default function App() {
     await requestScreenWakeLock();
 
     try {
-      setProcessingProgress('Optimizing audio acoustics & resampling (16kHz mono)...');
-      document.title = 'Optimizing audio...';
-      const { chunks, totalDurationSec } = await prepareOptimizedAudioChunks(blob, 20);
-      setAudioDurationSec(totalDurationSec);
+      let finalTimelineWords: WordToken[] = [];
+      let finalModelUsed = modelChoice;
 
-      const transcribeChunk = async (
-        chunk: typeof chunks[0],
-        activeScript?: string
-      ): Promise<{ words: WordToken[]; modelUsed?: string; detectedScript?: string }> => {
-        let lastErr: any = null;
-        for (let attempt = 0; attempt < 3; attempt++) {
-          try {
-            const resp = await fetch('/api/transcribe', {
+      if (engineType === 'whisper') {
+        // Whisper Engine: single-pass for files under 24MB, or chunked for large files
+        const isSinglePass = blob.size < 24 * 1024 * 1024;
+
+        if (isSinglePass) {
+          setProcessingProgress('Transcribing audio with Whisper Engine (single-pass word-level timestamps)...');
+          document.title = 'Transcribing with Whisper...';
+          const audioBase64 = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+              const res = reader.result as string;
+              resolve(res.split(',')[1] || '');
+            };
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+          });
+
+          const resp = await fetch('/api/transcribe-whisper', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              audioBase64,
+              mimeType: 'audio/wav',
+              durationSec,
+              provider: whisperConfig?.provider || 'groq',
+              apiKey: whisperConfig?.apiKey,
+              model: whisperConfig?.model || 'whisper-large-v3',
+              languageHint,
+              referenceTranscript,
+            }),
+          });
+
+          const data = await resp.json();
+          if (!resp.ok) {
+            throw new Error(data.error || `Whisper error (status ${resp.status})`);
+          }
+
+          finalTimelineWords = data.words || [];
+          finalModelUsed = data.modelUsed || 'Whisper';
+        } else {
+          setProcessingProgress('Optimizing large audio acoustics for Whisper...');
+          const { chunks, totalDurationSec } = await prepareOptimizedAudioChunks(blob, 20);
+          setAudioDurationSec(totalDurationSec);
+
+          const chunkResults: WordToken[][] = new Array(chunks.length);
+          for (let i = 0; i < chunks.length; i++) {
+            setProcessingProgress(`Transcribing with Whisper (segment ${i + 1} of ${chunks.length})...`);
+            const chunk = chunks[i];
+            const resp = await fetch('/api/transcribe-whisper', {
               method: 'POST',
-              credentials: 'include',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 audioBase64: chunk.base64,
                 mimeType: 'audio/wav',
                 durationSec: chunk.durationSec,
                 timeOffsetMs: chunk.offsetMs,
-                referenceTranscript: chunks.length === 1 ? referenceTranscript : undefined,
+                provider: whisperConfig?.provider || 'groq',
+                apiKey: whisperConfig?.apiKey,
+                model: whisperConfig?.model || 'whisper-large-v3',
                 languageHint,
-                modelChoice,
-                lockedScript: activeScript,
-                chunkIndex: chunk.chunkIndex,
+                chunkIndex: i,
                 totalChunks: chunks.length,
               }),
             });
-            const contentType = resp.headers.get('content-type') || '';
-            if (contentType.includes('application/json')) {
-              const data = await resp.json();
-              if (resp.ok && data.words && Array.isArray(data.words)) {
-                return {
-                  words: data.words,
-                  modelUsed: data.modelUsed,
-                  detectedScript: data.metadata?.detectedScript,
-                };
-              }
-              throw new Error(data.error || `HTTP ${resp.status}`);
-            } else {
-              if (resp.status === 413) {
-                throw new Error('Audio segment exceeded HTTP upload limits.');
-              }
-              throw new Error(`Server returned status ${resp.status}`);
-            }
-          } catch (err: any) {
-            lastErr = err;
-            if (attempt < 2) {
-              await new Promise((r) => setTimeout(r, 1200 * (attempt + 1)));
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.error || `Chunk ${i + 1} failed`);
+            chunkResults[i] = data.words || [];
+          }
+
+          let stitched: WordToken[] = enforceMonotonicTimeline(chunkResults[0] || []);
+          for (let i = 1; i < chunks.length; i++) {
+            const nextWords = chunkResults[i];
+            if (nextWords && nextWords.length > 0) {
+              stitched = stitchChunkTokens(stitched, nextWords, Math.round((chunks[i].overlapSec || 2.0) * 1000));
             }
           }
+          finalTimelineWords = enforceMonotonicTimeline(stitched, totalDurationSec * 1000);
+          finalModelUsed = `Whisper (${whisperConfig?.model || 'whisper-large-v3'})`;
         }
-        throw lastErr || new Error(`Failed to transcribe chunk ${chunk.chunkIndex + 1}`);
-      };
+      } else {
+        // Gemini AI Engine: parallel chunks (CONCURRENCY = 3, ~20s chunks)
+        setProcessingProgress('Optimizing audio acoustics & resampling (16kHz mono)...');
+        document.title = 'Optimizing audio...';
+        const { chunks, totalDurationSec } = await prepareOptimizedAudioChunks(blob, 20);
+        setAudioDurationSec(totalDurationSec);
 
-      const chunkResults: WordToken[][] = new Array(chunks.length);
-      let lastModel = modelChoice;
-      let lockedScript: string | undefined = undefined;
+        const transcribeChunk = async (
+          chunk: typeof chunks[0],
+          activeScript?: string
+        ): Promise<{ words: WordToken[]; modelUsed?: string; detectedScript?: string }> => {
+          let lastErr: any = null;
+          for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+              const resp = await fetch('/api/transcribe', {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  audioBase64: chunk.base64,
+                  mimeType: 'audio/wav',
+                  durationSec: chunk.durationSec,
+                  timeOffsetMs: chunk.offsetMs,
+                  referenceTranscript: chunks.length === 1 ? referenceTranscript : undefined,
+                  languageHint,
+                  modelChoice,
+                  lockedScript: activeScript,
+                  chunkIndex: chunk.chunkIndex,
+                  totalChunks: chunks.length,
+                }),
+              });
+              const contentType = resp.headers.get('content-type') || '';
+              if (contentType.includes('application/json')) {
+                const data = await resp.json();
+                if (resp.ok && data.words && Array.isArray(data.words)) {
+                  return {
+                    words: data.words,
+                    modelUsed: data.modelUsed,
+                    detectedScript: data.metadata?.detectedScript,
+                  };
+                }
+                throw new Error(data.error || `HTTP ${resp.status}`);
+              } else {
+                if (resp.status === 413) {
+                  throw new Error('Audio segment exceeded HTTP upload limits.');
+                }
+                throw new Error(`Server returned status ${resp.status}`);
+              }
+            } catch (err: any) {
+              lastErr = err;
+              if (attempt < 2) {
+                await new Promise((r) => setTimeout(r, 1200 * (attempt + 1)));
+              }
+            }
+          }
+          throw lastErr || new Error(`Failed to transcribe chunk ${chunk.chunkIndex + 1}`);
+        };
 
-      setProcessingProgress(
-        chunks.length > 1
-          ? `Transcribing segment 1 of ${chunks.length} (locking acoustic script)...`
-          : 'Analyzing speech and calculating millisecond timestamps...'
-      );
-      document.title = chunks.length > 1 ? `(1/${chunks.length}) Transcribing...` : 'Transcribing speech...';
-      const firstChunkResult = await transcribeChunk(chunks[0]);
-      chunkResults[0] = firstChunkResult.words;
-      if (firstChunkResult.modelUsed) lastModel = firstChunkResult.modelUsed;
-      lockedScript = firstChunkResult.detectedScript || detectDominantScript(firstChunkResult.words);
+        const chunkResults: WordToken[][] = new Array(chunks.length);
+        let lastModel = modelChoice;
+        let lockedScript: string | undefined = undefined;
 
-      if (chunks.length > 1) {
-        let completedCount = 1;
         setProcessingProgress(
-          `Transcribing speech segments in parallel (1/${chunks.length} complete — ${Math.round((1 / chunks.length) * 100)}%)...`
+          chunks.length > 1
+            ? `Transcribing segment 1 of ${chunks.length} (locking acoustic script)...`
+            : 'Analyzing speech and calculating millisecond timestamps...'
         );
-        const remainingIndices = Array.from({ length: chunks.length - 1 }, (_, idx) => idx + 1);
-        const CONCURRENCY = 3;
-        let queueIndex = 0;
-        const workers = Array.from({ length: Math.min(CONCURRENCY, remainingIndices.length) }, async (_, workerId: number) => {
-          if (workerId > 0) {
-            await new Promise((r) => setTimeout(r, 300 * workerId));
-          }
-          while (queueIndex < remainingIndices.length) {
-            const currentIdx = remainingIndices[queueIndex++];
-            const chunk = chunks[currentIdx];
-            const result = await transcribeChunk(chunk, lockedScript);
-            chunkResults[currentIdx] = result.words;
-            if (result.modelUsed) lastModel = result.modelUsed;
-            completedCount++;
-            const pct = Math.round((completedCount / chunks.length) * 100);
-            setProcessingProgress(
-              `Transcribing speech segments in parallel (${completedCount}/${chunks.length} complete — ${pct}%)...`
-            );
-            document.title = `(${pct}%) Transcribing audio...`;
-          }
-        });
-        await Promise.all(workers);
-      }
+        document.title = chunks.length > 1 ? `(1/${chunks.length}) Transcribing...` : 'Transcribing speech...';
+        const firstChunkResult = await transcribeChunk(chunks[0]);
+        chunkResults[0] = firstChunkResult.words;
+        if (firstChunkResult.modelUsed) lastModel = firstChunkResult.modelUsed;
+        lockedScript = firstChunkResult.detectedScript || detectDominantScript(firstChunkResult.words);
 
-      setProcessingProgress('Stitching unified timeline and enforcing monotonic alignment...');
-      document.title = 'Stitching timeline...';
-      let allWords: WordToken[] = enforceMonotonicTimeline(chunkResults[0] || []);
-      for (let i = 1; i < chunks.length; i++) {
-        const nextWords = chunkResults[i];
-        if (!nextWords || nextWords.length === 0) continue;
-        const overlapWindowMs = Math.round((chunks[i].overlapSec || 2.0) * 1000);
-        allWords = stitchChunkTokens(allWords, nextWords, overlapWindowMs);
+        if (chunks.length > 1) {
+          let completedCount = 1;
+          setProcessingProgress(
+            `Transcribing speech segments in parallel (1/${chunks.length} complete — ${Math.round((1 / chunks.length) * 100)}%)...`
+          );
+          const remainingIndices = Array.from({ length: chunks.length - 1 }, (_, idx) => idx + 1);
+          const CONCURRENCY = 3;
+          let queueIndex = 0;
+          const workers = Array.from({ length: Math.min(CONCURRENCY, remainingIndices.length) }, async (_, workerId: number) => {
+            if (workerId > 0) {
+              await new Promise((r) => setTimeout(r, 300 * workerId));
+            }
+            while (queueIndex < remainingIndices.length) {
+              const currentIdx = remainingIndices[queueIndex++];
+              const chunk = chunks[currentIdx];
+              const result = await transcribeChunk(chunk, lockedScript);
+              chunkResults[currentIdx] = result.words;
+              if (result.modelUsed) lastModel = result.modelUsed;
+              completedCount++;
+              const pct = Math.round((completedCount / chunks.length) * 100);
+              setProcessingProgress(
+                `Transcribing speech segments in parallel (${completedCount}/${chunks.length} complete — ${pct}%)...`
+              );
+              document.title = `(${pct}%) Transcribing audio...`;
+            }
+          });
+          await Promise.all(workers);
+        }
+
+        setProcessingProgress('Stitching unified timeline and enforcing monotonic alignment...');
+        document.title = 'Stitching timeline...';
+        let allWords: WordToken[] = enforceMonotonicTimeline(chunkResults[0] || []);
+        for (let i = 1; i < chunks.length; i++) {
+          const nextWords = chunkResults[i];
+          if (!nextWords || nextWords.length === 0) continue;
+          const overlapWindowMs = Math.round((chunks[i].overlapSec || 2.0) * 1000);
+          allWords = stitchChunkTokens(allWords, nextWords, overlapWindowMs);
+        }
+        finalTimelineWords = enforceMonotonicTimeline(allWords, totalDurationSec * 1000);
+        finalModelUsed = lastModel;
       }
-      let finalTimelineWords = enforceMonotonicTimeline(allWords, totalDurationSec * 1000);
 
       if (referenceTranscript && referenceTranscript.trim()) {
         setProcessingProgress('Applying 100% exact script alignment & removing duplicate hallucinations...');
@@ -348,7 +440,7 @@ export default function App() {
         const alignedResult = alignScriptWithAcousticTokens(
           referenceTranscript.trim(),
           finalTimelineWords,
-          totalDurationSec * 1000
+          durationSec * 1000
         );
         finalTimelineWords = alignedResult.words;
       }
@@ -356,9 +448,9 @@ export default function App() {
       setProcessingProgress('Performing 100% waveform acoustic alignment & zero-silence snapping (VAD)...');
       document.title = 'Acoustic waveform sync...';
       const finalProcessedWords = await snapWordsFromAudioBlob(finalTimelineWords, blob);
-      const sanitizedWords = enforceMonotonicTimeline(finalProcessedWords, totalDurationSec * 1000);
+      const sanitizedWords = enforceMonotonicTimeline(finalProcessedWords, durationSec * 1000);
       setWords(sanitizedWords);
-      setModelUsed(lastModel);
+      setModelUsed(finalModelUsed);
       document.title = 'AlignPulse - Completed';
     } catch (err: any) {
       console.error('Transcription failed:', err);

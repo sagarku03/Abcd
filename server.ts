@@ -481,13 +481,268 @@ Example:
   }
 });
 
+// Dedicated Whisper API endpoint (Groq whisper-large-v3 / OpenAI whisper-1) with native word timestamps
+app.post('/api/transcribe-whisper', async (req, res) => {
+  try {
+    const {
+      audioBase64,
+      mimeType = 'audio/wav',
+      durationSec,
+      provider = 'groq',
+      apiKey,
+      model,
+      languageHint,
+      referenceTranscript,
+      timeOffsetMs = 0,
+      chunkIndex = 0,
+      totalChunks = 1,
+    } = req.body;
+
+    if (!audioBase64) {
+      return res.status(400).json({ error: 'audioBase64 data is required for Whisper' });
+    }
+
+    // Determine effective API key
+    let effectiveKey = (apiKey || '').trim();
+    let effectiveProvider = provider.toLowerCase();
+
+    // Auto-detect provider if key prefix matches
+    if (effectiveKey.startsWith('gsk_')) {
+      effectiveProvider = 'groq';
+    } else if (effectiveKey.startsWith('sk-')) {
+      effectiveProvider = 'openai';
+    }
+
+    if (!effectiveKey) {
+      if (effectiveProvider === 'openai' && process.env.OPENAI_API_KEY) {
+        effectiveKey = process.env.OPENAI_API_KEY.trim();
+      } else if (process.env.GROQ_API_KEY) {
+        effectiveKey = process.env.GROQ_API_KEY.trim();
+        effectiveProvider = 'groq';
+      } else if (process.env.WHISPER_API_KEY) {
+        effectiveKey = process.env.WHISPER_API_KEY.trim();
+      }
+    }
+
+    if (!effectiveKey) {
+      return res.status(400).json({
+        error:
+          'Whisper API Key nahi mila! Kripya apna Groq API Key (console.groq.com se bilkul FREE) ya OpenAI API Key enter karein.',
+        needsApiKey: true,
+      });
+    }
+
+    const defaultModel = effectiveProvider === 'openai' ? 'whisper-1' : 'whisper-large-v3';
+    const effectiveModel = model || defaultModel;
+    const endpoint =
+      effectiveProvider === 'openai'
+        ? 'https://api.openai.com/v1/audio/transcriptions'
+        : 'https://api.groq.com/openai/v1/audio/transcriptions';
+
+    // Map language
+    let langCode: string | undefined = undefined;
+    if (languageHint && languageHint !== 'Auto-detect') {
+      const lower = languageHint.toLowerCase();
+      if (lower.includes('hindi') || lower.includes('hinglish')) langCode = 'hi';
+      else if (lower.includes('english')) langCode = 'en';
+      else if (lower.includes('spanish')) langCode = 'es';
+      else if (lower.includes('french')) langCode = 'fr';
+      else if (lower.includes('german')) langCode = 'de';
+      else if (lower.includes('japanese')) langCode = 'ja';
+    }
+
+    // Prepare multipart form data
+    const audioBuffer = Buffer.from(audioBase64, 'base64');
+    const fileBlob = new Blob([audioBuffer], { type: mimeType || 'audio/wav' });
+
+    const formData = new FormData();
+    formData.append('file', fileBlob, 'audio.wav');
+    formData.append('model', effectiveModel);
+    formData.append('response_format', 'verbose_json');
+    formData.append('timestamp_granularities[]', 'word');
+    formData.append('temperature', '0');
+
+    if (langCode) {
+      formData.append('language', langCode);
+    }
+    if (referenceTranscript && referenceTranscript.trim()) {
+      formData.append('prompt', referenceTranscript.trim().slice(0, 800));
+    }
+
+    console.log(`[WhisperEngine] Requesting ${effectiveProvider.toUpperCase()} (${effectiveModel}) for chunk ${chunkIndex + 1}/${totalChunks}...`);
+
+    const whisperResp = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${effectiveKey}`,
+      },
+      body: formData,
+    });
+
+    const data: any = await whisperResp.json();
+
+    if (!whisperResp.ok) {
+      const errorMsg = data?.error?.message || data?.error || `Whisper API failed with status ${whisperResp.status}`;
+      console.error('[WhisperEngine Error]:', errorMsg);
+      return res.status(whisperResp.status).json({
+        error: `${effectiveProvider.toUpperCase()} Whisper Error: ${errorMsg}`,
+      });
+    }
+
+    // Extract word-level timestamps
+    let parsedWords: ParsedWord[] = [];
+    const audioDurationMs = durationSec ? Math.round(durationSec * 1000) : undefined;
+
+    if (Array.isArray(data.words) && data.words.length > 0) {
+      parsedWords = data.words
+        .map((w: any, idx: number) => {
+          const rawWord = (w.word || '').trim();
+          if (!rawWord) return null;
+          const startMs = Math.round((w.start || 0) * 1000);
+          const endMs = Math.max(startMs + 60, Math.round((w.end || 0) * 1000));
+          return {
+            id: `whisper-${chunkIndex}-${idx}-${Date.now()}`,
+            word: rawWord,
+            startMs,
+            endMs,
+            startFormatted: formatMs(startMs),
+            endFormatted: formatMs(endMs),
+            durationMs: endMs - startMs,
+          };
+        })
+        .filter(Boolean) as ParsedWord[];
+    } else if (Array.isArray(data.segments) && data.segments.length > 0) {
+      // Fallback: segments with words or interpolated text
+      for (let sIdx = 0; sIdx < data.segments.length; sIdx++) {
+        const seg = data.segments[sIdx];
+        if (Array.isArray(seg.words) && seg.words.length > 0) {
+          for (let wIdx = 0; wIdx < seg.words.length; wIdx++) {
+            const w = seg.words[wIdx];
+            const rawWord = (w.word || '').trim();
+            if (!rawWord) continue;
+            const startMs = Math.round((w.start || 0) * 1000);
+            const endMs = Math.max(startMs + 60, Math.round((w.end || 0) * 1000));
+            parsedWords.push({
+              id: `whisper-${chunkIndex}-${sIdx}-${wIdx}-${Date.now()}`,
+              word: rawWord,
+              startMs,
+              endMs,
+              startFormatted: formatMs(startMs),
+              endFormatted: formatMs(endMs),
+              durationMs: endMs - startMs,
+            });
+          }
+        } else {
+          const segText = (seg.text || '').trim();
+          if (segText) {
+            const tokens = segText.split(/\s+/).filter(Boolean);
+            const segStart = Math.round((seg.start || 0) * 1000);
+            const segEnd = Math.max(segStart + tokens.length * 120, Math.round((seg.end || 0) * 1000));
+            const interpolated = interpolateMultiWordSpan(tokens, segStart, segEnd);
+            interpolated.forEach((item, tIdx) => {
+              parsedWords.push({
+                id: `whisper-seg-${chunkIndex}-${sIdx}-${tIdx}-${Date.now()}`,
+                word: item.word,
+                startMs: item.startMs,
+                endMs: item.endMs,
+                startFormatted: formatMs(item.startMs),
+                endFormatted: formatMs(item.endMs),
+                durationMs: item.endMs - item.startMs,
+              });
+            });
+          }
+        }
+      }
+    } else if (typeof data.text === 'string' && data.text.trim()) {
+      // Last-resort fallback for plain text response
+      const tokens = data.text.trim().split(/\s+/).filter(Boolean);
+      const endLimit = audioDurationMs || (tokens.length * 280);
+      const interpolated = interpolateMultiWordSpan(tokens, 0, endLimit);
+      parsedWords = interpolated.map((item, tIdx) => ({
+        id: `whisper-text-${tIdx}-${Date.now()}`,
+        word: item.word,
+        startMs: item.startMs,
+        endMs: item.endMs,
+        startFormatted: formatMs(item.startMs),
+        endFormatted: formatMs(item.endMs),
+        durationMs: item.endMs - item.startMs,
+      }));
+    }
+
+    // Apply time offset if audio was chunked
+    const offsetWords =
+      timeOffsetMs > 0
+        ? parsedWords.map((w) => ({
+            ...w,
+            startMs: w.startMs + timeOffsetMs,
+            endMs: w.endMs + timeOffsetMs,
+            startFormatted: formatMs(w.startMs + timeOffsetMs),
+            endFormatted: formatMs(w.endMs + timeOffsetMs),
+            durationMs: w.endMs - w.startMs,
+          }))
+        : parsedWords;
+
+    let wordsToReturn = offsetWords;
+    if (referenceTranscript && referenceTranscript.trim() && totalChunks === 1) {
+      const aligned = alignScriptWithAcousticTokens(
+        referenceTranscript.trim(),
+        offsetWords,
+        audioDurationMs ? audioDurationMs + timeOffsetMs : undefined
+      );
+      wordsToReturn = aligned.words;
+    }
+
+    const finalWords = enforceMonotonicTimeline(
+      wordsToReturn,
+      audioDurationMs ? audioDurationMs + timeOffsetMs : undefined
+    );
+
+    const finalRaw = finalWords.map((w) => `[${w.startFormatted} - ${w.endFormatted}] ${w.word}`).join('\n');
+    const detectedScript = detectDominantScript(finalWords);
+
+    console.log(`[WhisperEngine] Successfully extracted ${finalWords.length} words with word timestamps.`);
+
+    return res.json({
+      success: true,
+      modelUsed: `Whisper (${effectiveModel})`,
+      rawOutput: finalRaw,
+      words: finalWords,
+      metadata: {
+        totalWords: finalWords.length,
+        audioDurationMs:
+          (audioDurationMs ? audioDurationMs + timeOffsetMs : undefined) ||
+          (finalWords.length > 0 ? finalWords[finalWords.length - 1].endMs : 0),
+        firstTimestamp: finalWords.length > 0 ? finalWords[0].startFormatted : '00:00.000',
+        lastTimestamp: finalWords.length > 0 ? finalWords[finalWords.length - 1].endFormatted : '00:00.000',
+        detectedScript,
+      },
+    });
+  } catch (err: any) {
+    console.error('Whisper transcription error:', err);
+    return res.status(500).json({
+      error: err?.message || 'Failed to transcribe audio with Whisper',
+    });
+  }
+});
+
 // Engine configuration & health status endpoint
 app.get('/api/engine-status', (req, res) => {
   const keys = getAvailableApiKeys();
+  const hasGroqKey = !!process.env.GROQ_API_KEY;
+  const hasOpenAIKey = !!process.env.OPENAI_API_KEY;
+  const hasWhisperKey = hasGroqKey || hasOpenAIKey || !!process.env.WHISPER_API_KEY;
+
   res.json({
     activeKeysCount: keys.length,
     hasSecondaryKey: keys.length > 1,
     models: ['gemini-3.1-flash-lite', 'gemini-3.5-transcribe', 'gemini-3.8-flash'],
+    whisper: {
+      available: true,
+      hasGroqKey,
+      hasOpenAIKey,
+      hasServerKey: hasWhisperKey,
+      defaultModel: 'whisper-large-v3',
+    },
   });
 });
 
