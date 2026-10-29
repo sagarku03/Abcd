@@ -15,6 +15,10 @@ jobs:
     name: Build & Release Android APK
     runs-on: ubuntu-latest
 
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -25,14 +29,10 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Set up Node.js
+      - name: Set up Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
       - name: Install Dependencies & Build Web App
         run: |
@@ -44,17 +44,21 @@ jobs:
           mkdir -p android/app/src/main/assets/public
           cp -r dist/* android/app/src/main/assets/public/
 
+      - name: Accept Android SDK Licenses
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
       - name: Build Android Debug APK
         working-directory: ./android
         run: |
-          chmod +x gradlew || gradle wrapper
-          ./gradlew assembleDebug --stacktrace
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Verify APK Generated
         run: |
-          APK_PATH="android/app/build/outputs/apk/debug/app-debug.apk"
-          if [ ! -f "$APK_PATH" ]; then
-            echo "ERROR: APK was not found at $APK_PATH"
+          APK_PATH=$(find android/app/build/outputs/apk/debug -name "*.apk" | head -n 1)
+          if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then
+            echo "ERROR: APK was not found"
             exit 1
           fi
           echo "APK successfully built: $(ls -lh $APK_PATH)"
@@ -74,10 +78,10 @@ jobs:
           # Delete existing release with same tag if rerun
           gh release delete "$TAG_NAME" --yes || true
           
-          # Delete existing latest release asset if present to ensure clean update
+          # Create latest release and upload asset
           gh release create "$TAG_NAME" apk-distribution/app-debug.apk \
             --title "$RELEASE_TITLE" \
-            --notes "Direct installable Android APK for AlignPulse. Built with GitHub Actions." \
+            --notes "Direct installable Android APK for AlignPulse." \
             --latest
 
       - name: Summary
