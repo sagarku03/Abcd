@@ -1,0 +1,7 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Theme.AlignPulse" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="android:statusBarColor">#09090b</item>
+        <item name="android:navigationBarColor">#09090b</item>
+        <item name="android:windowBackground">#09090b</item>
+    </style>
+</resources>
